@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, time
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import select, and_
-
+from app.models.staff import Staff
 from app.core.deps import get_db, get_token_payload
 from app.models.appointment import Appointment, AppointmentStatus
 from app.models.service import Service
@@ -60,9 +60,18 @@ def availability(
 
     duration_min = _calc_total_duration_min(services)
 
-    # Working hours (MVP): 10am-8pm
-    start_work = datetime.combine(day_date, time(10, 0))
-    end_work = datetime.combine(day_date, time(20, 0))
+    
+
+    staff = db.scalar(select(Staff).where(Staff.tenant_id == tenant_id, Staff.id == staff_uuid))
+    if not staff:
+        raise HTTPException(status_code=404, detail="Staff not found")
+
+    start_hour, start_min = map(int, staff.work_start_time.split(":"))
+    end_hour, end_min = map(int, staff.work_end_time.split(":"))
+
+    start_work = datetime.combine(day_date, time(start_hour, start_min))
+    end_work = datetime.combine(day_date, time(end_hour, end_min))
+
 
     # Fetch existing appointments for that day
     day_start = datetime.combine(day_date, time(0, 0))

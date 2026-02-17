@@ -2,20 +2,19 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import select
-
-from app.core.deps import get_db, get_token_payload
+from app.core.deps import get_db, get_token_payload,require_roles
 from app.core.config import settings
-from app.integration.razorpay import verify_razorpay_webhook_signature
+from app.integration.razorpay import verify_razorpay_webhook_signature,verify_razorpay_checkout_signature
 from app.integration.razorpay_client import client
+from app.models.user import UserRole
+from decimal import Decimal
+from datetime import datetime
 
 from app.models.appointment import Appointment, PaymentStatus as ApptPayStatus
 from app.models.customer import Customer
 from app.models.payment import Payment, PaymentProvider, PaymentStatus
 from app.models.payment_event import PaymentEvent
-from app.schemas.payment import CreateRazorpayOrderIn, CreateRazorpayOrderOut
-from app.schemas.payment import RazorpayVerifyIn
-from app.integration.razorpay import verify_razorpay_checkout_signature
-from app.schemas.payment import RefundIn
+from app.schemas.payment import CreateRazorpayOrderIn, CreateRazorpayOrderOut,RazorpayVerifyIn,RefundIn
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
 
@@ -47,13 +46,13 @@ def create_razorpay_order(
 
     # Create Razorpay order (SDK)
     order = client.order.create({
+        
         "amount": int(round(float(body.amount) * 100)),  # paisa
         "currency": body.currency,
         "receipt": f"appt_{appt_id}",
         "notes": {"tenant_id": str(tenant_id), "appointment_id": str(appt_id)},
     })
     provider_order_id = order["id"]
-
     customer = db.scalar(select(Customer).where(Customer.tenant_id == tenant_id, Customer.id == appt.customer_id))
 
     # Create payment row
@@ -61,12 +60,14 @@ def create_razorpay_order(
         tenant_id=tenant_id,
         appointment_id=appt.id,
         customer_id=appt.customer_id,
-        provider=PaymentProvider.RAZORPAY,
         status=PaymentStatus.CREATED,
         amount=body.amount,
-        currency=body.currency,
         provider_order_id=provider_order_id,
+        appointment_id=appt.id,
+        currency="INR",
+        provider="razorpay",
     )
+    
     db.add(pay)
     db.flush()  # ensures pay.id is available without commit
 
@@ -220,6 +221,8 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
 
 
 
+
+
 @router.post("/razorpay/verify")
 def razorpay_verify(
     body: RazorpayVerifyIn,
@@ -231,6 +234,10 @@ def razorpay_verify(
     pay = db.scalar(select(Payment).where(Payment.id == body.payment_id, Payment.tenant_id == tenant_id))
     if not pay:
         raise HTTPException(status_code=404, detail="Payment not found")
+
+    # ✅ Idempotency: already captured -> success
+    if pay.status == PaymentStatus.CAPTURED:
+        return {"success": True, "payment_status": pay.status}
 
     if pay.provider_order_id != body.razorpay_order_id:
         raise HTTPException(status_code=400, detail="Order ID mismatch")
@@ -244,9 +251,20 @@ def razorpay_verify(
     if not ok:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
+    # ✅ Fetch payment from Razorpay
     rp_payment = client.payment.fetch(body.razorpay_payment_id)
     rp_status = rp_payment.get("status", "")
+    rp_amount_paisa = int(rp_payment.get("amount", 0))
+    rp_currency = rp_payment.get("currency", "")
 
+    # ✅ Validate amount/currency match what YOU expected
+    expected_paisa = int(Decimal(str(pay.amount)) * 100)
+    if rp_currency != pay.currency:
+        raise HTTPException(status_code=400, detail="Currency mismatch")
+    if rp_amount_paisa != expected_paisa:
+        raise HTTPException(status_code=400, detail="Amount mismatch")
+
+    # ✅ Update payment status
     pay.provider_payment_id = body.razorpay_payment_id
     if rp_status == "captured":
         pay.status = PaymentStatus.CAPTURED
@@ -254,58 +272,61 @@ def razorpay_verify(
         pay.status = PaymentStatus.AUTHORIZED
     elif rp_status == "failed":
         pay.status = PaymentStatus.FAILED
+    else:
+        pay.status = PaymentStatus.FAILED
 
+    # ✅ Update appointment status
     appt = db.scalar(select(Appointment).where(Appointment.id == pay.appointment_id, Appointment.tenant_id == tenant_id))
-    if appt:
-        if pay.status == PaymentStatus.CAPTURED:
-            appt.payment_status = ApptPayStatus.PAID
+    if appt and pay.status == PaymentStatus.CAPTURED:
+        appt.payment_status = ApptPayStatus.PAID
 
-            from app.services.receipt_service import generate_receipt_pdf
-            from app.workers.tasks import send_booking_email
+    # ✅ Create event
+    db.add(PaymentEvent(
+        tenant_id=tenant_id,
+        provider=PaymentProvider.RAZORPAY,
+        event_type="checkout.verified",
+        provider_event_id=None,
+        provider_order_id=body.razorpay_order_id,
+        provider_payment_id=body.razorpay_payment_id,
+        payload={"razorpay_payment": rp_payment},
+    ))
 
-            pdf_bytes = generate_receipt_pdf(
-                receipt_no=str(pay.id),
-                customer_name="Customer",
-                amount=float(pay.amount),
-                currency=pay.currency,
-            )
+    # ✅ Receipt + email async (idempotent)
+    if pay.status == PaymentStatus.CAPTURED and pay.receipt_sent_at is None:
+        customer = db.scalar(select(Customer).where(Customer.tenant_id == tenant_id, Customer.id == appt.customer_id)) if appt else None
 
-            # You must update your Celery task to support attachments
-            send_booking_email.delay(
-                to_email="customer@email.com",
-                subject="Payment Receipt",
-                body="Your payment was successful.",
-                attachment=pdf_bytes
-            )
+        from app.services.receipt_service import generate_receipt_pdf
+        from app.workers.tasks import send_email  # <-- use the fixed celery task I gave you
 
-            db.add(PaymentEvent(
-                tenant_id=tenant_id,
-                provider=PaymentProvider.RAZORPAY,
-                event_type="checkout.verified",
-                provider_event_id=None,
-                provider_order_id=body.razorpay_order_id,
-                provider_payment_id=body.razorpay_payment_id,
-                payload={"razorpay_payment": rp_payment},
-            ))
+        pdf_bytes = generate_receipt_pdf(
+            receipt_no=str(pay.id),
+            customer_name=customer.full_name if customer else "Customer",
+            amount=float(pay.amount),
+            currency=pay.currency,
+        )
 
-            db.commit()
-        elif pay.status == PaymentStatus.FAILED:
-            appt.payment_status = ApptPayStatus.FAILED
+        send_email.delay(
+            to_email=(customer.email if customer and customer.email else "fallback@email.com"),
+            subject="Payment Receipt",
+            body="Your payment was successful. Receipt attached.",
+            attachment_bytes=pdf_bytes,
+            attachment_name=f"receipt_{pay.id}.pdf",
+        )
 
+        pay.receipt_sent_at = datetime.utcnow()
+
+    db.commit()
     return {"success": True, "payment_status": pay.status}
 
 
-@router.post("/razorpay/refund")
+
+@router.post("/razorpay/refund", dependencies=[Depends(require_roles(UserRole.OWNER, UserRole.MANAGER))])
 def razorpay_refund(
     body: RefundIn,
     db: Session = Depends(get_db),
     payload: dict = Depends(get_token_payload),
 ):
     tenant_id = uuid.UUID(payload["tenant_id"])
-
-    # ✅ OPTIONAL BUT RECOMMENDED: admin-only guard
-    # if payload.get("role") not in ["ADMIN", "OWNER"]:
-    #     raise HTTPException(status_code=403, detail="Not allowed")
 
     pay = db.scalar(select(Payment).where(Payment.id == body.payment_id, Payment.tenant_id == tenant_id))
     if not pay:
@@ -317,6 +338,14 @@ def razorpay_refund(
     if not pay.provider_payment_id:
         raise HTTPException(status_code=400, detail="Payment not captured / missing provider_payment_id")
 
+    # ✅ Only allow refunds for CAPTURED payments
+    if pay.status != PaymentStatus.CAPTURED:
+        raise HTTPException(status_code=400, detail="Only CAPTURED payments can be refunded")
+
+    # ✅ Check if already refunded
+    if pay.refund_id and pay.refund_status == "processed":
+        raise HTTPException(status_code=400, detail="Payment already refunded")
+
     refund_payload = {}
     if body.amount is not None:
         if body.amount <= 0:
@@ -326,12 +355,20 @@ def razorpay_refund(
     # ✅ Create refund via Razorpay
     refund = client.payment.refund(pay.provider_payment_id, refund_payload)
 
-    # ✅ Update status
-    pay.status = PaymentStatus.REFUNDED
+    # ✅ Store refund info
+    pay.refund_id = refund.get("id")
+    pay.refund_status = refund.get("status")  # typically "processed" or "pending"
 
-    appt = db.scalar(select(Appointment).where(Appointment.id == pay.appointment_id, Appointment.tenant_id == tenant_id))
-    if appt:
-        appt.payment_status = ApptPayStatus.REFUNDED
+    # ✅ Only mark REFUNDED if Razorpay says processed
+    if pay.refund_status == "processed":
+        pay.status = PaymentStatus.REFUNDED
+        
+        appt = db.scalar(select(Appointment).where(Appointment.id == pay.appointment_id, Appointment.tenant_id == tenant_id))
+        if appt:
+            appt.payment_status = ApptPayStatus.REFUNDED
+    else:
+        # keep status CAPTURED until webhook confirms refunded
+        pass
 
     # ✅ Log event
     db.add(PaymentEvent(
@@ -345,4 +382,19 @@ def razorpay_refund(
     ))
 
     db.commit()
-    return {"success": True, "refund": refund}
+    return {"success": True, "refund": refund, "payment_status": pay.status, "refund_status": pay.refund_status}
+
+from app.core.deps import get_branch_id
+
+@router.get("/")
+def list_payments(
+    db: Session = Depends(get_db),
+    payload: dict = Depends(get_token_payload),
+    branch_id: uuid.UUID = Depends(get_branch_id),
+):
+    tenant_id = uuid.UUID(payload["tenant_id"])
+    q = select(Payment).where(
+        Payment.tenant_id == tenant_id,
+        Payment.branch_id == branch_id,
+    )
+    return db.scalars(q).all()

@@ -18,6 +18,9 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
 
+    # ✅ Refresh token storage (hashed)
+    refresh_token_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     role: Mapped[str] = mapped_column(String(20), default=UserRole.OWNER, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 

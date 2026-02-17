@@ -2,6 +2,8 @@ from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from app.core.config import settings
+import hashlib
+import hmac
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -87,3 +89,21 @@ def decode_token(token: str) -> dict:
         raise ValueError("Token has expired") from None
     except JWTError:
         raise ValueError("Invalid token") from None
+
+def hash_refresh_token(token: str) -> str:
+    """
+    Hash refresh tokens before storing in DB.
+    Using HMAC with JWT_SECRET as pepper prevents rainbow-table attacks.
+    """
+    if not token:
+        raise ValueError("Missing refresh token")
+    return hmac.new(
+        key=settings.JWT_SECRET.encode("utf-8"),
+        msg=token.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+def verify_refresh_token_hash(token: str, token_hash: str) -> bool:
+    if not token or not token_hash:
+        return False
+    return hmac.compare_digest(hash_refresh_token(token), token_hash)

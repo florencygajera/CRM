@@ -2,19 +2,15 @@ import uuid
 from datetime import datetime, timedelta, time
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from app.models.staff import Staff
-from app.core.deps import get_db, get_token_payload
+from app.core.deps import get_db, get_token_payload, get_branch_id
 from app.models.appointment import Appointment, AppointmentStatus
 from app.models.service import Service
 from app.models.appointment_service import AppointmentService
 from app.schemas.appointment import AppointmentCreateIn, AppointmentPatchIn
-from fastapi import BackgroundTasks
-from app.core.config import settings
-from app.integration.email import send_email_smtp
 from app.models.customer import Customer
 from app.workers.tasks import send_booking_email
-from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/appointments")
 
@@ -23,9 +19,19 @@ def _calc_total_duration_min(services: list[Service]) -> int:
     return sum(int(s.duration_min) for s in services)
 
 
-def _overlap_exists(db: Session, *, tenant_id, staff_user_id, start_at: datetime, end_at: datetime, exclude_id=None) -> bool:
+def _overlap_exists(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    branch_id: uuid.UUID,
+    staff_user_id: uuid.UUID,
+    start_at: datetime,
+    end_at: datetime,
+    exclude_id: uuid.UUID | None = None,
+) -> bool:
     stmt = select(Appointment.id).where(
         Appointment.tenant_id == tenant_id,
+        Appointment.branch_id == branch_id,
         Appointment.staff_user_id == staff_user_id,
         Appointment.status != AppointmentStatus.CANCELLED,
         Appointment.start_at < end_at,
@@ -44,12 +50,11 @@ def availability(
     slot_step_min: int = Query(15, ge=5, le=60),
     db: Session = Depends(get_db),
     payload: dict = Depends(get_token_payload),
+    branch_id: uuid.UUID = Depends(get_branch_id),
 ):
     """
-    Returns available start times for a staff on a given day.
-    MVP assumptions:
-    - Working hours: 10:00 to 20:00
-    - No breaks
+    Returns available start times for a staff on a given day (branch-scoped).
+    Uses staff working hours (work_start_time/work_end_time).
     """
     tenant_id = uuid.UUID(payload["tenant_id"])
     staff_uuid = uuid.UUID(staff_user_id)
@@ -60,15 +65,26 @@ def availability(
         raise HTTPException(status_code=400, detail="Invalid day format. Use YYYY-MM-DD")
 
     svc_uuids = [uuid.UUID(s) for s in service_ids]
-    services = db.scalars(select(Service).where(Service.tenant_id == tenant_id, Service.id.in_(svc_uuids), Service.is_active == True)).all()
+    services = db.scalars(
+        select(Service).where(
+            Service.tenant_id == tenant_id,
+            Service.id.in_(svc_uuids),
+            Service.is_active == True,
+        )
+    ).all()
     if len(services) != len(svc_uuids):
         raise HTTPException(status_code=400, detail="One or more services not found")
 
     duration_min = _calc_total_duration_min(services)
 
-    
-
-    staff = db.scalar(select(Staff).where(Staff.tenant_id == tenant_id, Staff.id == staff_uuid))
+    staff = db.scalar(
+        select(Staff).where(
+            Staff.tenant_id == tenant_id,
+            Staff.id == staff_uuid,
+            # If staff is branch-scoped in your DB, uncomment:
+            # Staff.branch_id == branch_id,
+        )
+    )
     if not staff:
         raise HTTPException(status_code=404, detail="Staff not found")
 
@@ -78,14 +94,13 @@ def availability(
     start_work = datetime.combine(day_date, time(start_hour, start_min))
     end_work = datetime.combine(day_date, time(end_hour, end_min))
 
-
-    # Fetch existing appointments for that day
     day_start = datetime.combine(day_date, time(0, 0))
     day_end = datetime.combine(day_date, time(23, 59, 59))
 
     existing = db.scalars(
         select(Appointment).where(
             Appointment.tenant_id == tenant_id,
+            Appointment.branch_id == branch_id,
             Appointment.staff_user_id == staff_uuid,
             Appointment.status != AppointmentStatus.CANCELLED,
             Appointment.start_at >= day_start,
@@ -95,7 +110,7 @@ def availability(
 
     busy = [(a.start_at, a.end_at) for a in existing]
 
-    slots = []
+    slots: list[str] = []
     cursor = start_work
     while cursor + timedelta(minutes=duration_min) <= end_work:
         cand_start = cursor
@@ -120,6 +135,7 @@ def create_appointment(
     body: AppointmentCreateIn,
     db: Session = Depends(get_db),
     payload: dict = Depends(get_token_payload),
+    branch_id: uuid.UUID = Depends(get_branch_id),
 ):
     tenant_id = uuid.UUID(payload["tenant_id"])
 
@@ -131,22 +147,29 @@ def create_appointment(
         select(Service).where(
             Service.tenant_id == tenant_id,
             Service.id.in_(svc_uuids),
-            Service.is_active == True
+            Service.is_active == True,
         )
     ).all()
-
     if len(services) != len(svc_uuids):
         raise HTTPException(status_code=400, detail="One or more services not found")
 
     duration_min = _calc_total_duration_min(services)
     end_time = body.start_at + timedelta(minutes=duration_min)
 
-    # double-book prevention
-    if _overlap_exists(db, tenant_id=tenant_id, staff_user_id=staff_uuid, start_at=body.start_at, end_at=end_time):
+    # Double-book prevention (branch-scoped)
+    if _overlap_exists(
+        db,
+        tenant_id=tenant_id,
+        branch_id=branch_id,
+        staff_user_id=staff_uuid,
+        start_at=body.start_at,
+        end_at=end_time,
+    ):
         raise HTTPException(status_code=400, detail="Time slot already booked")
 
     appt = Appointment(
         tenant_id=tenant_id,
+        branch_id=branch_id,  # ✅ REQUIRED
         customer_id=customer_uuid,
         staff_user_id=staff_uuid,
         start_at=body.start_at,
@@ -155,18 +178,9 @@ def create_appointment(
         notes=body.notes,
     )
     db.add(appt)
-    db.flush()
+    db.flush()  # get appt.id
 
-   
-
-    reminder_time = datetime.now() + timedelta(minutes=1)
-
-    send_booking_email.apply_async(
-        args=[customer.email, "Test Reminder ⏰", email_body],
-        eta=reminder_time
-)
-
-    # Save service snapshots
+    # Save service snapshots for this appointment
     for s in services:
         db.add(
             AppointmentService(
@@ -181,50 +195,38 @@ def create_appointment(
     db.commit()
     db.refresh(appt)
 
-    # Send emails AFTER commit
+    # Email after commit
     customer = db.scalar(
-        select(Customer).where(Customer.tenant_id == tenant_id, Customer.id == customer_uuid)
+        select(Customer).where(
+            Customer.tenant_id == tenant_id,
+            Customer.id == customer_uuid,
+            # If customers are branch-scoped, uncomment:
+            # Customer.branch_id == branch_id,
+        )
     )
 
-    if customer and customer.email:
-        from datetime import timezone
-
+    if customer and getattr(customer, "email", None):
         subject = "Booking Confirmed ✅"
         email_body = (
-            f"Your appointment is confirmed.\n"
+            "Your appointment is confirmed.\n"
             f"Start: {appt.start_at}\n"
             f"End: {appt.end_at}\n"
             f"Status: {appt.status}"
         )
 
-            # Send confirmation now
-    send_booking_email.delay(customer.email, "Booking Confirmed ✅", email_body)
+        # send immediately
+        send_booking_email.delay(customer.email, subject, email_body)
 
-    # Schedule reminder 24 hours before
-    reminder_time = appt.start_at - timedelta(hours=24)
-
-    # If your datetimes are naive, we schedule anyway (works). Better is timezone-aware.
-    if reminder_time.tzinfo is None:
-        send_booking_email.apply_async(
-            args=[customer.email, "Appointment Reminder ⏰", email_body],
-            eta=reminder_time
-        )
-    else:
-        if reminder_time > datetime.now(timezone.utc):
+        # reminder 24 hours before
+        reminder_time = appt.start_at - timedelta(hours=24)
+        # schedule only if reminder is in the future
+        if reminder_time > datetime.utcnow():
             send_booking_email.apply_async(
                 args=[customer.email, "Appointment Reminder ⏰", email_body],
-                eta=reminder_time
+                eta=reminder_time,
             )
 
-    return {
-        "success": True,
-        "data": {
-            "id": str(appt.id),
-            "start_at": appt.start_at,
-            "end_at": appt.end_at,
-            "status": appt.status
-        }
-    }
+    return {"success": True, "data": {"id": str(appt.id), "start_at": appt.start_at, "end_at": appt.end_at, "status": appt.status}}
 
 
 @router.patch("/{appointment_id}")
@@ -233,11 +235,18 @@ def patch_appointment(
     body: AppointmentPatchIn,
     db: Session = Depends(get_db),
     payload: dict = Depends(get_token_payload),
+    branch_id: uuid.UUID = Depends(get_branch_id),
 ):
     tenant_id = uuid.UUID(payload["tenant_id"])
     appt_id = uuid.UUID(appointment_id)
 
-    appt = db.scalar(select(Appointment).where(Appointment.tenant_id == tenant_id, Appointment.id == appt_id))
+    appt = db.scalar(
+        select(Appointment).where(
+            Appointment.tenant_id == tenant_id,
+            Appointment.branch_id == branch_id,  # ✅ enforce branch
+            Appointment.id == appt_id,
+        )
+    )
     if not appt:
         raise HTTPException(status_code=404, detail="Appointment not found")
 
@@ -251,7 +260,15 @@ def patch_appointment(
         duration = int((appt.end_at - appt.start_at).total_seconds() // 60)
         new_end = new_start + timedelta(minutes=duration)
 
-        if _overlap_exists(db, tenant_id=tenant_id, staff_user_id=appt.staff_user_id, start_at=new_start, end_at=new_end, exclude_id=appt.id):
+        if _overlap_exists(
+            db,
+            tenant_id=tenant_id,
+            branch_id=branch_id,
+            staff_user_id=appt.staff_user_id,
+            start_at=new_start,
+            end_at=new_end,
+            exclude_id=appt.id,
+        ):
             raise HTTPException(status_code=400, detail="Time slot already booked")
 
         appt.start_at = new_start
@@ -264,3 +281,17 @@ def patch_appointment(
     db.refresh(appt)
 
     return {"success": True, "data": {"id": str(appt.id), "start_at": appt.start_at, "end_at": appt.end_at, "status": appt.status}}
+
+
+@router.get("/")
+def list_appointments(
+    db: Session = Depends(get_db),
+    payload: dict = Depends(get_token_payload),
+    branch_id: uuid.UUID = Depends(get_branch_id),
+):
+    tenant_id = uuid.UUID(payload["tenant_id"])
+    q = select(Appointment).where(
+        Appointment.tenant_id == tenant_id,
+        Appointment.branch_id == branch_id,
+    ).order_by(Appointment.start_at.desc())
+    return db.scalars(q).all()

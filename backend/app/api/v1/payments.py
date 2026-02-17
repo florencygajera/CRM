@@ -218,29 +218,19 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
     return {"success": True}
 
 
+
 @router.post("/razorpay/verify")
 def razorpay_verify(
     body: RazorpayVerifyIn,
     db: Session = Depends(get_db),
     payload: dict = Depends(get_token_payload),
 ):
-    # Safely get tenant_id from payload
-    tenant_id_str = payload.get("tenant_id")
-    if not tenant_id_str:
-        raise HTTPException(status_code=400, detail="Missing tenant_id in token")
-    try:
-        tenant_id = uuid.UUID(tenant_id_str)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid tenant_id format")
+    tenant_id = uuid.UUID(payload["tenant_id"])
 
-    pay = db.scalar(select(Payment).where(
-        Payment.id == body.payment_id,
-        Payment.tenant_id == tenant_id
-    ))
+    pay = db.scalar(select(Payment).where(Payment.id == body.payment_id, Payment.tenant_id == tenant_id))
     if not pay:
         raise HTTPException(status_code=404, detail="Payment not found")
 
-    # must match order id
     if pay.provider_order_id != body.razorpay_order_id:
         raise HTTPException(status_code=400, detail="Order ID mismatch")
 
@@ -248,46 +238,98 @@ def razorpay_verify(
         order_id=body.razorpay_order_id,
         payment_id=body.razorpay_payment_id,
         signature=body.razorpay_signature,
-        key_secret=settings.RAZORPAY_KEY_SECRET
+        key_secret=settings.RAZORPAY_KEY_SECRET,
     )
     if not ok:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    # update payment as captured/authorized? (best: fetch actual payment from Razorpay)
-    # We'll fetch status from Razorpay to be accurate:
     rp_payment = client.payment.fetch(body.razorpay_payment_id)
-    status = rp_payment.get("status", "")
+    rp_status = rp_payment.get("status", "")
 
     pay.provider_payment_id = body.razorpay_payment_id
-
-    if status == "captured":
+    if rp_status == "captured":
         pay.status = PaymentStatus.CAPTURED
-    elif status == "authorized":
+    elif rp_status == "authorized":
         pay.status = PaymentStatus.AUTHORIZED
-    elif status == "failed":
+    elif rp_status == "failed":
         pay.status = PaymentStatus.FAILED
 
-    # update appointment payment status if captured
     appt = db.scalar(select(Appointment).where(Appointment.id == pay.appointment_id, Appointment.tenant_id == tenant_id))
     if appt:
         if pay.status == PaymentStatus.CAPTURED:
             appt.payment_status = ApptPayStatus.PAID
+
+            from app.services.receipt_service import generate_receipt_pdf
+            from app.workers.tasks import send_booking_email
+
+            pdf_bytes = generate_receipt_pdf(
+                receipt_no=str(pay.id),
+                customer_name="Customer",
+                amount=float(pay.amount),
+                currency=pay.currency,
+            )
+
+            # You must update your Celery task to support attachments
+            send_booking_email.delay(
+                to_email="customer@email.com",
+                subject="Payment Receipt",
+                body="Your payment was successful.",
+                attachment=pdf_bytes
+            )
+
+            db.add(PaymentEvent(
+                tenant_id=tenant_id,
+                provider=PaymentProvider.RAZORPAY,
+                event_type="checkout.verified",
+                provider_event_id=None,
+                provider_order_id=body.razorpay_order_id,
+                provider_payment_id=body.razorpay_payment_id,
+                payload={"razorpay_payment": rp_payment},
+            ))
+
+            db.commit()
         elif pay.status == PaymentStatus.FAILED:
             appt.payment_status = ApptPayStatus.FAILED
 
-    # store event (idempotent-ish)
+    return {"success": True, "payment_status": pay.status}
+
+
+@router.post("/razorpay/refund")
+def razorpay_refund(
+    body: RefundIn,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(get_token_payload),
+):
+    tenant_id = uuid.UUID(payload["tenant_id"])
+
+    pay = db.scalar(select(Payment).where(Payment.id == body.payment_id, Payment.tenant_id == tenant_id))
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    if not pay.provider_payment_id:
+        raise HTTPException(status_code=400, detail="No provider_payment_id to refund")
+
+    refund_payload = {}
+    if body.amount is not None:
+        refund_payload["amount"] = int(round(float(body.amount) * 100))
+
+    refund = client.payment.refund(pay.provider_payment_id, refund_payload)
+
+    pay.status = PaymentStatus.REFUNDED
+
+    appt = db.scalar(select(Appointment).where(Appointment.id == pay.appointment_id, Appointment.tenant_id == tenant_id))
+    if appt:
+        appt.payment_status = ApptPayStatus.REFUNDED
+
     db.add(PaymentEvent(
         tenant_id=tenant_id,
         provider=PaymentProvider.RAZORPAY,
-        event_type="checkout.verified",
-        provider_event_id=None,
-        provider_payment_id=body.razorpay_payment_id,
-        provider_order_id=body.razorpay_order_id,
-        payload={"razorpay_payment": rp_payment},
+        event_type="refund.created",
+        provider_event_id=refund.get("id"),
+        provider_order_id=pay.provider_order_id,
+        provider_payment_id=pay.provider_payment_id,
+        payload=refund,
     ))
 
     db.commit()
-    return {"success": True, "status": pay.status}
-
-
-    
+    return {"success": True, "refund": refund}

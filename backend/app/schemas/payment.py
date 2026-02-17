@@ -15,7 +15,7 @@ class CreateOrderOut(BaseModel):
     key_id: str
 
 class RazorpayVerifyIn(BaseModel):
-    payment_id: UUID              # our DB payment.id
+    payment_id: UUID
     razorpay_order_id: str
     razorpay_payment_id: str
     razorpay_signature: str
@@ -29,3 +29,6 @@ class CreateRazorpayOrderIn(BaseModel):
 class CreateRazorpayOrderOut(BaseModel):
     success: bool
     data: dict
+class RefundIn(BaseModel):
+    payment_id: UUID
+    amount: float | None = None  # if None => full refund

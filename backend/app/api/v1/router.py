@@ -12,4 +12,3 @@ router.include_router(staff.router, tags=["staff"])
 router.include_router(reports.router, tags=["reports"])
 router.include_router(payments.router, tags=["payments"])
 api_router.include_router(payments_router)
-

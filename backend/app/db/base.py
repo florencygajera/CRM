@@ -13,3 +13,4 @@ from app.models.appointment import Appointment  # noqa
 from app.models.appointment_service import AppointmentService  # noqa
 from app.models.payment import Payment  # noqa
 from app.models.payment_event import PaymentEvent  # noqa
+ # noqa

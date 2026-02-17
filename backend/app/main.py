@@ -12,10 +12,13 @@ from app.models.appointment_service import AppointmentService
 from app.models.staff import Staff  
 from app.models.payment import Payment  # noqa: F401
 from app.models.payment_event import PaymentEvent  # noqa: F401
+from app.api.v1.router import api_router
 
 
-app = FastAPI(title=settings.APP_NAME)
+app = FastAPI(title="SmartServeAI")
 
+
+app.include_router(api_router, prefix="/api/v1")
 
 @app.on_event("startup")
 def startup():

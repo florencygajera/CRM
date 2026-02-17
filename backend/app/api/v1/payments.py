@@ -15,6 +15,7 @@ from app.models.payment_event import PaymentEvent
 from app.schemas.payment import CreateRazorpayOrderIn, CreateRazorpayOrderOut
 from app.schemas.payment import RazorpayVerifyIn
 from app.integration.razorpay import verify_razorpay_checkout_signature
+from app.schemas.payment import RefundIn
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
 
@@ -302,25 +303,37 @@ def razorpay_refund(
 ):
     tenant_id = uuid.UUID(payload["tenant_id"])
 
+    # ✅ OPTIONAL BUT RECOMMENDED: admin-only guard
+    # if payload.get("role") not in ["ADMIN", "OWNER"]:
+    #     raise HTTPException(status_code=403, detail="Not allowed")
+
     pay = db.scalar(select(Payment).where(Payment.id == body.payment_id, Payment.tenant_id == tenant_id))
     if not pay:
         raise HTTPException(status_code=404, detail="Payment not found")
 
+    if pay.provider != PaymentProvider.RAZORPAY:
+        raise HTTPException(status_code=400, detail="Not a Razorpay payment")
+
     if not pay.provider_payment_id:
-        raise HTTPException(status_code=400, detail="No provider_payment_id to refund")
+        raise HTTPException(status_code=400, detail="Payment not captured / missing provider_payment_id")
 
     refund_payload = {}
     if body.amount is not None:
-        refund_payload["amount"] = int(round(float(body.amount) * 100))
+        if body.amount <= 0:
+            raise HTTPException(status_code=400, detail="Refund amount must be > 0")
+        refund_payload["amount"] = int(round(float(body.amount) * 100))  # paisa
 
+    # ✅ Create refund via Razorpay
     refund = client.payment.refund(pay.provider_payment_id, refund_payload)
 
+    # ✅ Update status
     pay.status = PaymentStatus.REFUNDED
 
     appt = db.scalar(select(Appointment).where(Appointment.id == pay.appointment_id, Appointment.tenant_id == tenant_id))
     if appt:
         appt.payment_status = ApptPayStatus.REFUNDED
 
+    # ✅ Log event
     db.add(PaymentEvent(
         tenant_id=tenant_id,
         provider=PaymentProvider.RAZORPAY,

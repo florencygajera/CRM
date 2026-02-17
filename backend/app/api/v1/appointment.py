@@ -1,4 +1,5 @@
 import uuid
+from app.core.deps import get_db
 from datetime import datetime, timedelta, time
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session

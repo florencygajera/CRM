@@ -1,39 +1,38 @@
-from fastapi import Depends, HTTPException, Header
-from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session
-from app.db.session import SessionLocal,get_db
-from app.core.security import decode_token
 import uuid
+from typing import Generator
+from fastapi import Depends, HTTPException, Header
+from sqlalchemy.orm import Session
 from sqlalchemy import select
-from app.core.deps import get_token_payload  # if already in same file, remove this line
+
+from app.db.session import SessionLocal
+from app.core.security import decode_token
 from app.models.branch import Branch
+from app.models.user import UserRole
 
 
-oauth2 = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
-
-def get_db():
+def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-def get_token_payload(token: str = Depends(oauth2)) -> dict:
-    try:
-        payload = decode_token(token)
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    if payload.get("type") != "access":
-        raise HTTPException(status_code=401, detail="Access token required")
-    return payload
 
-def require_roles(*allowed: str):
-    def _guard(payload: dict = Depends(get_token_payload)) -> dict:
+def get_token_payload(authorization: str = Header(...)) -> dict:
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = authorization.split(" ", 1)[1].strip()
+    return decode_token(token)
+
+
+def require_roles(*roles: str):
+    def _checker(payload: dict = Depends(get_token_payload)):
         role = payload.get("role")
-        if role not in allowed:
-            raise HTTPException(status_code=403, detail="Forbidden")
-        return payload
-    return _guard
+        if role not in roles:
+            raise HTTPException(status_code=403, detail="Not enough permissions")
+        return True
+    return _checker
+
 
 def get_branch_id(
     x_branch_id: str = Header(..., alias="X-Branch-Id"),
